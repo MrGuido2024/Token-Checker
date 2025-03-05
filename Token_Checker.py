@@ -155,13 +155,12 @@ def process_honeypot(token_address):
     else:
         result["IsHoneypot"] = {"valid": False, "message": "No response"}
     
-    # Overall Honeypot status
     overall_valid = (result["ContractVerification"].get("valid") and result["IsHoneypot"].get("valid"))
     result["status"] = "good" if overall_valid else "bad"
     return result
 
 def process_quickintel(token_address, chain, config, session):
-    """Call QuickIntel API and return only the relevant validation data."""
+    """Call QuickIntel API and return only the relevant validation data, with detailed findings."""
     payload = json.dumps({
         "chain": chain,
         "tokenAddress": token_address,
@@ -170,7 +169,7 @@ def process_quickintel(token_address, chain, config, session):
     })
     data = api_post_with_retries(QUICKINTEL_API_URL, get_headers(), payload, session)
     if not data:
-        return {"valid": False, "message": "No response from QuickIntel"}
+        return {"valid": False, "message": "No response from QuickIntel", "findings": []}
     
     # Extract tokenDetails
     token_details = data.get("tokenDetails") or {}
@@ -182,32 +181,46 @@ def process_quickintel(token_address, chain, config, session):
         "tokenSupply": token_details.get("tokenSupply")
     }
     
-    # Validate tokenDynamicDetails
+    # Validate tokenDynamicDetails with detailed findings
     dyn = data.get("tokenDynamicDetails") or {}
+    dyn_findings = []
     try:
         buy_tax = float(dyn.get("buy_Tax") or 0)
-        see_tax = float(dyn.get("see_Tax") or 0)
+        sell_tax = float(dyn.get("sell_Tax") or 0)
         transfer_tax = float(dyn.get("transfer_Tax") or 0)
     except (ValueError, TypeError):
-        buy_tax = see_tax = transfer_tax = 0
-    dyn_valid = (dyn.get("is_Honeypot") is False and
-                 dyn.get("has_Trading_Cooldown") is False and
-                 buy_tax <= 5 and see_tax <= 5 and transfer_tax <= 5 and
-                 dyn.get("isAirdropPhishingScam") is False and
-                 dyn.get("contractVerified") is True)
+        buy_tax = sell_tax = transfer_tax = 0
     
-    # Validate quickiAudit (sample validations)
+    if dyn.get("is_Honeypot") is not False:
+        dyn_findings.append("is_Honeypot is not False")
+    if buy_tax > 5:
+        dyn_findings.append("buy_Tax exceeds 5%")
+    if sell_tax > 5:
+        dyn_findings.append("sell_Tax exceeds 5%")
+    if transfer_tax > 5:
+        dyn_findings.append("transfer_Tax exceeds 5%")
+    
+    # Check top-level keys for isAirdropPhishingScam and contractVerified
+    top_isAirdropPhishingScam = data.get("isAirdropPhishingScam")
+    top_contractVerified = data.get("contractVerified")
+    if top_isAirdropPhishingScam is not False:
+        dyn_findings.append("isAirdropPhishingScam is not False")
+    if top_contractVerified is not True:
+        dyn_findings.append("contractVerified is not True")
+    
+    dyn_valid = (len(dyn_findings) == 0)
+    
+    # Validate quickiAudit with detailed findings
     audit = data.get("quickiAudit") or {}
-    audit_valid = (audit.get("contract_Renounced") is True and
-                   audit.get("hidden_Owner") is False and
-                   audit.get("is_Proxy") is False)
+    audit_findings = []
+    if audit.get("contract_Renounced") is not True:
+        audit_findings.append("contract_Renounced is not True")
+    if audit.get("hidden_Owner") is not False:
+        audit_findings.append("hidden_Owner is not False")
+    if audit.get("is_Proxy") is not False:
+        audit_findings.append("is_Proxy is not False")
     
-    # Record findings if validations fail
-    findings = []
-    if not dyn_valid:
-        findings.append("tokenDynamicDetailsValid is false")
-    if not audit_valid:
-        findings.append("quickiAuditValid is false")
+    audit_valid = (len(audit_findings) == 0)
     
     # Extract function names from specific arrays in audit
     functions_to_extract = [
@@ -238,15 +251,21 @@ def process_quickintel(token_address, chain, config, session):
                 categorized_links["Other Links"].append(url)
     
     overall_valid = dyn_valid and audit_valid
+    all_findings = []
+    if not dyn_valid:
+        all_findings.extend(dyn_findings)
+    if not audit_valid:
+        all_findings.extend(audit_findings)
+    
     result = {
         "tokenDetails": details,
         "tokenDynamicDetailsValid": dyn_valid,
         "quickiAuditValid": audit_valid,
         "extractedFunctions": extracted_functions,
         "contractLinks": categorized_links,
-        "findings": findings,
         "status": "good" if overall_valid else "bad",
-        "message": "Valid" if overall_valid else "Failed validation in dynamic details or audit"
+        "message": "Valid" if overall_valid else "Failed validation in dynamic details or audit",
+        "findings": all_findings
     }
     return result
 
@@ -286,7 +305,7 @@ def process_token(token, config, session):
     result_entry["quickintel"] = quickintel_result
     if quickintel_result.get("status") != "good":
         overall_valid = False
-        print(f"Token {token_address} failed QuickIntel validation: {quickintel_result.get('message')}")
+        print(f"Token {token_address} failed QuickIntel validation: {quickintel_result.get('findings')}")
     
     result_entry["status"] = "good" if overall_valid else "bad"
     return result_entry
