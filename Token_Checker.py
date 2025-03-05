@@ -12,7 +12,7 @@ from urllib3.util.retry import Retry
 # FILE & API CONFIGURATION
 # -------------------------------
 TEST_TOKENS_FILE = "test_tokens.json"
-CHECKED_RESULTS_FILE = "test_checked.json"
+CHECKED_RESULTS_FILE = "test_checked2.json"
 CONFIG_FILE = "quick_intel_config.json"
 COOKIE_FILE = "cookies.txt"
 
@@ -173,7 +173,7 @@ def process_quickintel(token_address, chain, config, session):
         return {"valid": False, "message": "No response from QuickIntel"}
     
     # Extract tokenDetails
-    token_details = data.get("tokenDetails", {})
+    token_details = data.get("tokenDetails") or {}
     details = {
         "tokenName": token_details.get("tokenName"),
         "tokenSymbol": token_details.get("tokenSymbol"),
@@ -183,7 +183,7 @@ def process_quickintel(token_address, chain, config, session):
     }
     
     # Validate tokenDynamicDetails
-    dyn = data.get("tokenDynamicDetails", {})
+    dyn = data.get("tokenDynamicDetails") or {}
     try:
         buy_tax = float(dyn.get("buy_Tax") or 0)
         see_tax = float(dyn.get("see_Tax") or 0)
@@ -197,10 +197,17 @@ def process_quickintel(token_address, chain, config, session):
                  dyn.get("contractVerified") is True)
     
     # Validate quickiAudit (sample validations)
-    audit = data.get("quickiAudit", {})
+    audit = data.get("quickiAudit") or {}
     audit_valid = (audit.get("contract_Renounced") is True and
                    audit.get("hidden_Owner") is False and
                    audit.get("is_Proxy") is False)
+    
+    # Record findings if validations fail
+    findings = []
+    if not dyn_valid:
+        findings.append("tokenDynamicDetailsValid is false")
+    if not audit_valid:
+        findings.append("quickiAuditValid is false")
     
     # Extract function names from specific arrays in audit
     functions_to_extract = [
@@ -216,8 +223,8 @@ def process_quickintel(token_address, chain, config, session):
         func_list = audit.get(key)
         extracted_functions[key] = extract_function_names(func_list)
     
-    # Process contract_Links categorization
-    links = data.get("contract_Links", [])
+    # Process contract links from quickiAudit.contract_Links
+    links = audit.get("contract_Links") or []
     categorized_links = {"Telegram": [], "Twitter": [], "Website": [], "Other Links": []}
     for url in links:
         if isinstance(url, str):
@@ -237,6 +244,7 @@ def process_quickintel(token_address, chain, config, session):
         "quickiAuditValid": audit_valid,
         "extractedFunctions": extracted_functions,
         "contractLinks": categorized_links,
+        "findings": findings,
         "status": "good" if overall_valid else "bad",
         "message": "Valid" if overall_valid else "Failed validation in dynamic details or audit"
     }
