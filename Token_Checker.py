@@ -11,6 +11,8 @@ import os
 import re
 import time
 import logging
+import signal
+import atexit
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Union
 
@@ -24,6 +26,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import pybreaker
 from prometheus_client import start_http_server, Counter, Histogram
+from tenacity import retry, stop_after_attempt, wait_exponential
+from requests.exceptions import HTTPError  # Import HTTPError
 
 # Supabase integration
 from supabase import create_client, Client
@@ -33,8 +37,12 @@ from supabase import create_client, Client
 # ------------------------------------------------------------------------------
 load_dotenv()
 
-SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
+SUPABASE_URL: str = os.getenv("SUPABASE_URL")
+SUPABASE_KEY: str = os.getenv("SUPABASE_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    logging.critical("Missing Supabase credentials in .env")
+    exit(1)
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Check if Supabase client is correctly initialized
@@ -49,19 +57,19 @@ else:
 # Prometheus Metrics Configuration
 # ------------------------------------------------------------------------------
 GET_REQUEST_COUNTER: Counter = Counter(
-    "api_get_requests_total", "Total GET API requests", ["endpoint"]
+    "api_get_requests_total", "Total GET API requests", ["endpoint", "chain"]
 )
 POST_REQUEST_COUNTER: Counter = Counter(
-    "api_post_requests_total", "Total POST API requests", ["endpoint"]
+    "api_post_requests_total", "Total POST API requests", ["endpoint", "chain"]
 )
 API_ERROR_COUNTER: Counter = Counter(
-    "api_errors_total", "Total API errors", ["endpoint"]
+    "api_errors_total", "Total API errors", ["endpoint", "chain"]
 )
 GET_REQUEST_DURATION: Histogram = Histogram(
-    "api_get_request_duration_seconds", "GET API request duration", ["endpoint"]
+    "api_get_request_duration_seconds", "GET API request duration", ["endpoint", "chain"]
 )
 POST_REQUEST_DURATION: Histogram = Histogram(
-    "api_post_request_duration_seconds", "POST API request duration", ["endpoint"]
+    "api_post_request_duration_seconds", "POST API request duration", ["endpoint", "chain"]
 )
 SUPABASE_REQUEST_COUNTER: Counter = Counter(
     "supabase_requests_total", "Total Supabase requests", ["operation"]
@@ -78,7 +86,7 @@ LOG_FILENAME: str = "app.log"
 logger: logging.Logger = logging.getLogger("TokenProcessor")
 logger.setLevel(logging.DEBUG)
 
-handler = RotatingFileHandler(LOG_FILENAME, maxBytes=1010241024, backupCount=5)
+handler = RotatingFileHandler(LOG_FILENAME, maxBytes=10 * 1024 * 1024, backupCount=5)  # 10MB per file
 formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
@@ -112,10 +120,47 @@ TOKENS_TO_CHECK_TABLE: str = "tokens_to_check"
 TOKEN_CHECKS_TABLE: str = "token_checks"
 CHECK_INTERVAL_SECONDS: int = 5
 
+# Graceful shutdown flag
+shutdown_flag = False
+
 
 # ------------------------------------------------------------------------------
 # Utility Functions
 # ------------------------------------------------------------------------------
+def validate_supabase_connection() -> None:
+    """Validate Supabase connection at startup."""
+    try:
+        response = supabase.table(TOKENS_TO_CHECK_TABLE).select("count", count="exact").execute()
+        if response.count >= 0:
+            logger.info("Supabase connection validated.")
+        else:
+            raise ConnectionError("Invalid Supabase response")
+    except Exception as e:
+        logger.critical(f"Supabase connection failed: {e}")
+        exit(1)
+
+
+def handle_signal(signum, frame):
+    """Handle SIGTERM/SIGINT for graceful shutdown."""
+    global shutdown_flag
+    shutdown_flag = True
+    logger.info("Shutdown signal received. Finishing current work...")
+
+
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, handle_signal)
+
+
+def cleanup():
+    """Cleanup resources on exit."""
+    if supabase:
+        supabase.auth.sign_out()
+    logger.info("Cleanup completed.")
+
+
+atexit.register(cleanup)
+
+
 def load_config() -> Dict[str, Any]:
     """
     Load QuickIntel configuration from a JSON file.
@@ -178,37 +223,48 @@ def get_headers() -> Dict[str, str]:
     }
 
 
-def api_get_with_retries(url: str, params: Dict[str, Any], timeout: int = 30) -> Optional[Any]:
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
+def api_get_with_retries(url: str, params: Dict[str, Any], chain: str, timeout: int = 30) -> Optional[Any]:
     """
     Perform a GET request with retries, exponential backoff, and a circuit breaker.
 
     Args:
         url (str): The API endpoint URL.
         params (Dict[str, Any]): Query parameters for the GET request.
+        chain (str): The blockchain chain identifier.
         timeout (int): Timeout for the request in seconds.
 
     Returns:
         Optional[Any]: JSON response or None if all retries fail.
     """
-    GET_REQUEST_COUNTER.labels(endpoint=url).inc()
+    GET_REQUEST_COUNTER.labels(endpoint=url, chain=chain).inc()
     for attempt in range(RETRY_ATTEMPTS):
         try:
-            with GET_REQUEST_DURATION.labels(endpoint=url).time():
+            with GET_REQUEST_DURATION.labels(endpoint=url, chain=chain).time():
                 response = breaker_get.call(
                     requests.get, url, params=params, timeout=timeout
                 )
                 response.raise_for_status()
                 return response.json()
-        except Exception as e:
-            API_ERROR_COUNTER.labels(endpoint=url).inc()
+        except HTTPError as e:  # Catch HTTPError specifically
+            API_ERROR_COUNTER.labels(endpoint=url, chain=chain).inc()
+            if e.response.status_code == 404:
+                logger.warning(f"Honeypot API 404 for {url} (token: {params.get('address')}, chain: {chain}). Data not found by Honeypot.")
+            else:
+                logger.error(f"Error on GET {url} attempt {attempt+1}: {e}") # General error logging remains
+            if attempt < RETRY_ATTEMPTS - 1:
+                time.sleep(RETRY_DELAY * (2 ** attempt))
+        except Exception as e: # Catch other exceptions
+            API_ERROR_COUNTER.labels(endpoint=url, chain=chain).inc()
             logger.error(f"Error on GET {url} attempt {attempt+1}: {e}")
             if attempt < RETRY_ATTEMPTS - 1:
                 time.sleep(RETRY_DELAY * (2 ** attempt))
     return None
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
 def api_post_with_retries(
-    url: str, headers: Dict[str, str], data: str, session: Session, timeout: int = 30
+    url: str, headers: Dict[str, str], data: str, session: Session, chain: str, timeout: int = 30
 ) -> Optional[Any]:
     """
     Perform a POST request with retries, exponential backoff, and a circuit breaker.
@@ -218,15 +274,16 @@ def api_post_with_retries(
         headers (Dict[str, str]): Request headers.
         data (str): JSON string data to send in the request body.
         session (Session): The configured requests session.
+        chain (str): The blockchain chain identifier.
         timeout (int): Timeout for the request in seconds.
 
     Returns:
         Optional[Any]: JSON response or None if all retries fail.
     """
-    POST_REQUEST_COUNTER.labels(endpoint=url).inc()
+    POST_REQUEST_COUNTER.labels(endpoint=url, chain=chain).inc()
     for attempt in range(RETRY_ATTEMPTS):
         try:
-            with POST_REQUEST_DURATION.labels(endpoint=url).time():
+            with POST_REQUEST_DURATION.labels(endpoint=url, chain=chain).time():
                 response = breaker_post.call(
                     session.post, url, headers=headers, data=data, timeout=timeout
                 )
@@ -234,7 +291,7 @@ def api_post_with_retries(
                 session.cookies.save(ignore_discard=True, ignore_expires=True)
                 return response.json()
         except Exception as e:
-            API_ERROR_COUNTER.labels(endpoint=url).inc()
+            API_ERROR_COUNTER.labels(endpoint=url, chain=chain).inc()
             logger.error(f"Error on POST {url} attempt {attempt+1}: {e}")
             if attempt < RETRY_ATTEMPTS - 1:
                 time.sleep(RETRY_DELAY * (2 ** attempt))
@@ -318,6 +375,7 @@ def apply_special_cases(
 # ------------------------------------------------------------------------------
 # Supabase Data Interaction Functions
 # ------------------------------------------------------------------------------
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
 def fetch_unchecked_tokens_from_supabase() -> List[Dict[str, Any]]:
     """
     Fetch tokens with 'unchecked' status from the Supabase 'tokens_to_check' table.
@@ -342,6 +400,7 @@ def fetch_unchecked_tokens_from_supabase() -> List[Dict[str, Any]]:
         return []
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
 def update_token_status_to_checked(token_address: str, chain: str) -> bool:
     """
     Update the status of a token in the Supabase 'tokens_to_check' table to 'checked'.
@@ -372,12 +431,13 @@ def update_token_status_to_checked(token_address: str, chain: str) -> bool:
 # ------------------------------------------------------------------------------
 # Honeypot & QuickIntel Processing
 # ------------------------------------------------------------------------------
-def process_honeypot(token_address: str) -> Dict[str, Any]:
+def process_honeypot(token_address: str, chain: str) -> Dict[str, Any]:
     """
     Call both Honeypot endpoints and return validation data about the token.
 
     Args:
         token_address (str): The contract address of the token to check.
+        chain (str): The blockchain chain identifier.
 
     Returns:
         Dict[str, Any]: A dictionary containing contract verification and honeypot status.
@@ -386,7 +446,7 @@ def process_honeypot(token_address: str) -> Dict[str, Any]:
     params: Dict[str, str] = {"address": token_address}
 
     # ContractVerification endpoint
-    cv = api_get_with_retries(HONEYPOT_CV_URL, params)
+    cv = api_get_with_retries(HONEYPOT_CV_URL, params, chain)
     if cv:
         cv_valid = (
             cv.get("isRootOpenSource") is True
@@ -398,15 +458,15 @@ def process_honeypot(token_address: str) -> Dict[str, Any]:
             "hasProxyCalls": cv.get("summary", {}).get("hasProxyCalls"),
             "isOpenSource": cv.get("summary", {}).get("isOpenSource"),
             "valid": cv_valid,
-            "message": "Valid"
+            "message": "Contract Verification Passed"
             if cv_valid
-            else "Failed validation for ContractVerification",
+            else "Contract Verification Failed", # More descriptive message
         }
     else:
-        result["ContractVerification"] = {"valid": False, "message": "No response"}
+        result["ContractVerification"] = {"valid": False, "message": "Honeypot API: No Contract Verification data found for this token."} # Improved message
 
     # IsHoneypot endpoint
-    ih = api_get_with_retries(HONEYPOT_IH_URL, params)
+    ih = api_get_with_retries(HONEYPOT_IH_URL, params, chain)
     if ih:
         is_honeypot = ih.get("honeypotResult", {}).get("isHoneypot")
         siphoned = ih.get("holderAnalysis", {}).get("siphoned", "")
@@ -419,9 +479,9 @@ def process_honeypot(token_address: str) -> Dict[str, Any]:
             and not flags
         )
         message = (
-            "Valid"
+            "Honeypot Check Passed" # Improved message
             if ih_valid
-            else f"Failed validation: Token is honeypot: {ih.get('honeypotResult', {}).get('honeypotReason', '')}"
+            else f"Honeypot Check Failed: Token is a honeypot. Reason: {ih.get('honeypotResult', {}).get('honeypotReason', '')}" # More descriptive
         )
         result["IsHoneypot"] = {
             "isHoneypot": is_honeypot,
@@ -433,7 +493,7 @@ def process_honeypot(token_address: str) -> Dict[str, Any]:
             "message": message,
         }
     else:
-        result["IsHoneypot"] = {"valid": False, "message": "No response"}
+        result["IsHoneypot"] = {"valid": False, "message": "Honeypot API: No IsHoneypot data found for this token."} # Improved message
 
     overall_valid = (
         result["ContractVerification"].get("valid")
@@ -470,13 +530,13 @@ def process_quickintel(
         }
     )
     data: Optional[Dict[str, Any]] = api_post_with_retries(
-        QUICKINTEL_API_URL, get_headers(), payload, session, timeout=timeout
+        QUICKINTEL_API_URL, get_headers(), payload, session, chain, timeout=timeout
     )
     if not data:
         logger.error(f"No response from QuickIntel for token {token_address}")
         return {
             "valid": False,
-            "message": "No response from QuickIntel",
+            "message": "QuickIntel API: No response received.", # Improved message
             "findings": [],
             "fetchStatus": "failed",
         }
@@ -502,17 +562,17 @@ def process_quickintel(
         buy_tax = see_tax = transfer_tax = 0
 
     if dyn.get("is_Honeypot") is not False:
-        dyn_findings.append("is_Honeypot is not False")
+        dyn_findings.append("Dynamic Details: is_Honeypot is not False") # More context in findings
     if buy_tax > 5:
-        dyn_findings.append("buy_Tax exceeds 5%")
+        dyn_findings.append("Dynamic Details: buy_Tax exceeds 5%") # More context in findings
     if see_tax > 5:
-        dyn_findings.append("see_Tax exceeds 5%")
+        dyn_findings.append("Dynamic Details: see_Tax exceeds 5%") # More context in findings
     if transfer_tax > 5:
-        dyn_findings.append("transfer_Tax exceeds 5%")
+        dyn_findings.append("Dynamic Details: transfer_Tax exceeds 5%") # More context in findings
     if data.get("isAirdropPhishingScam") is not False:
-        dyn_findings.append("isAirdropPhishingScam is not False")
+        dyn_findings.append("Dynamic Details: isAirdropPhishingScam is not False") # More context in findings
     if data.get("contractVerified") is not True:
-        dyn_findings.append("contractVerified is not True")
+        dyn_findings.append("Dynamic Details: contractVerified is not True") # More context in findings
 
     dyn_valid: bool = len(dyn_findings) == 0
 
@@ -520,27 +580,27 @@ def process_quickintel(
     audit: Dict[str, Any] = data.get("quickiAudit") or {}
     audit_findings: List[str] = []
     if "contract_Renounced" in audit and audit["contract_Renounced"] is not True:
-        audit_findings.append("contract_Renounced is not True")
+        audit_findings.append("Audit: contract_Renounced is not True") # More context in findings
     if "hidden_Owner" in audit and audit["hidden_Owner"] is not False:
-        audit_findings.append("hidden_Owner is not False")
+        audit_findings.append("Audit: hidden_Owner is not False") # More context in findings
     if "is_Proxy" in audit and audit["is_Proxy"] is not False:
-        audit_findings.append("is_Proxy is not False")
+        audit_findings.append("Audit: is_Proxy is not False") # More context in findings
 
     # Additional validations
     if "has_Scams" not in audit:
         audit_findings.append(
-            "Validation passed for has_Scams due to missing data from API."
+            "Audit: Validation passed for has_Scams due to missing data from API." # More context in findings
         )
     elif audit.get("has_Scams") is not False:
-        audit_findings.append("has_Scams is not False (potential scam history detected)")
+        audit_findings.append("Audit: has_Scams is not False (potential scam history detected)") # More context in findings
 
     if "has_Known_Scam_Wallet_Funding" not in audit:
         audit_findings.append(
-            "Validation passed for has_Known_Scam_Wallet_Funding due to missing data from API."
+            "Audit: Validation passed for has_Known_Scam_Wallet_Funding due to missing data from API." # More context in findings
         )
     elif audit.get("has_Known_Scam_Wallet_Funding") is not False:
         audit_findings.append(
-            "has_Known_Scam_Wallet_Funding is not False (funded by known scam wallets)"
+            "Audit: has_Known_Scam_Wallet_Funding is not False (funded by known scam wallets)" # More context in findings
         )
 
     audit_valid: bool = len(audit_findings) == 0
@@ -593,7 +653,7 @@ def process_quickintel(
         "extractedFunctions": extracted_functions,
         "contractLinks": categorized_links,
         "status": "good" if overall_valid else "bad",
-        "message": "Valid" if overall_valid else "Failed validation in dynamic details or audit",
+        "message": "QuickIntel Validation Passed" if overall_valid else "QuickIntel Validation Failed", # Improved message
         "findings": all_findings,
     }
 
@@ -636,7 +696,7 @@ def process_token(token: Dict[str, Any], config: Dict[str, Any], session: Sessio
     try:
         # Honeypot check (if chain is supported by the Honeypot API)
         if chain in HONEYPOT_CHAINS:
-            honeypot_result: Dict[str, Any] = process_honeypot(token_address)
+            honeypot_result: Dict[str, Any] = process_honeypot(token_address, chain)
             result_entry["honeypot"] = honeypot_result
             if honeypot_result.get("status") != "good":
                 overall_valid = False
@@ -673,8 +733,10 @@ def process_token(token: Dict[str, Any], config: Dict[str, Any], session: Sessio
                 "status": result_entry["status"],
             }
         ).execute()
+        SUPABASE_REQUEST_COUNTER.labels(operation="insert_token_checks").inc() # Add metrics for supabase insert
 
     except Exception as e:
+        SUPABASE_ERROR_COUNTER.labels(operation="insert_token_checks").inc() # Add metrics for supabase insert error
         logger.error(f"Failed to process/store token {token_address}: {e}")
         result_entry["status"] = "failed"
         # Append the error message for local reference
@@ -704,11 +766,14 @@ def main() -> None:
         config = load_config()
         session = configure_session()
 
+        # Validate Supabase connection
+        validate_supabase_connection()
+
         # Start Prometheus metrics server
         start_http_server(8000)
         logger.info("Prometheus metrics server started on port 8000.")
 
-        while True:
+        while not shutdown_flag:
             logger.info("Checking for new tokens to process...")
             tokens_to_process: List[Dict[str, Any]] = fetch_unchecked_tokens_from_supabase()
 
