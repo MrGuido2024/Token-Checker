@@ -1,9 +1,10 @@
 """
 Token_Checker.py
-This script analyzes cryptocurrency tokens using Honeypot and QuickIntel APIs, then
-stores the results in a Supabase database for further tracking (e.g., Telegram alerts).
-It reads tokens to be checked from a Supabase table ('tokens_to_check'), updates their status after processing,
-and includes robust error handling, logging, Prometheus metrics, and retry/circuit-breaker mechanisms.
+Analyzes cryptocurrency tokens using Honeypot/QuickIntel APIs and stores results in Supabase.
+Implements robust error handling, metrics, and retry logic.
+Supports processing of tokens on various blockchains, checking for security vulnerabilities and compliance.
+Includes checks for honeypots, tax rates, contract audits, and scam history (configurable for specific chains).
+Extracts function names related to potential risks and categorizes contract-related links.
 """
 
 import json
@@ -15,8 +16,9 @@ import signal
 import atexit
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Union
+from datetime import datetime, timezone
 
-# Environment variable handling for Supabase credentials
+# Environment variable handling
 from dotenv import load_dotenv
 
 import requests
@@ -27,13 +29,13 @@ from urllib3.util.retry import Retry
 import pybreaker
 from prometheus_client import start_http_server, Counter, Histogram
 from tenacity import retry, stop_after_attempt, wait_exponential
-from requests.exceptions import HTTPError  # Import HTTPError
+from requests.exceptions import HTTPError
 
 # Supabase integration
 from supabase import create_client, Client
 
 # ------------------------------------------------------------------------------
-# Load environment variables (e.g., SUPABASE_URL, SUPABASE_KEY)
+# Load environment variables
 # ------------------------------------------------------------------------------
 load_dotenv()
 
@@ -45,13 +47,11 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Check if Supabase client is correctly initialized
 if supabase:
-    logging.info("Successfully initialized Supabase client.")
+    logging.info("Supabase client initialized.")
 else:
-    logging.critical("Failed to initialize Supabase client. Check SUPABASE_URL and SUPABASE_KEY.")
+    logging.critical("Failed to initialize Supabase client.")
     exit(1)
-
 
 # ------------------------------------------------------------------------------
 # Prometheus Metrics Configuration
@@ -78,7 +78,6 @@ SUPABASE_ERROR_COUNTER: Counter = Counter(
     "supabase_errors_total", "Total Supabase errors", ["operation"]
 )
 
-
 # ------------------------------------------------------------------------------
 # Logging Configuration
 # ------------------------------------------------------------------------------
@@ -86,49 +85,60 @@ LOG_FILENAME: str = "app.log"
 logger: logging.Logger = logging.getLogger("TokenProcessor")
 logger.setLevel(logging.DEBUG)
 
-handler = RotatingFileHandler(LOG_FILENAME, maxBytes=10 * 1024 * 1024, backupCount=5)  # 10MB per file
+handler = RotatingFileHandler(LOG_FILENAME, maxBytes=10*1024*1024, backupCount=5)
 formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # ------------------------------------------------------------------------------
-# File & API Configuration
+# Configuration Constants
 # ------------------------------------------------------------------------------
 CONFIG_FILE: str = "quick_intel_config.json"
 COOKIE_FILE: str = "cookies.txt"
+QUICKINTEL_API_TIMEOUT_SECONDS: int = 60
 
-# Honeypot and QuickIntel API endpoints
+# API Endpoints
 HONEYPOT_CV_URL: str = "https://api.honeypot.is/v2/GetContractVerification"
 HONEYPOT_IH_URL: str = "https://api.honeypot.is/v2/IsHoneypot"
 QUICKINTEL_API_URL: str = "https://app.quickintel.io/api/quicki/getquickiauditfull"
 
-# User-Agent and supported chains
+# Chain Configuration
 USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0"
 HONEYPOT_CHAINS: set = {"eth", "bsc", "base"}
+QUICKINTEL_SUPPORTED_CHAINS: set = {
+    "abstract", "ink", "berachain", "eth", "base", "bsc", "solana",
+    "avalanche", "cronos", "injective", "pulse", "sonic", "sui",
+    "tron", "unichain", "zora"
+}
+SCAM_CHECK_CHAINS: set = {"eth", "base"}
 
-# Retry and circuit-breaker settings
+# Retry/Circuit Breaker Settings
 RETRY_ATTEMPTS: int = 3
-RETRY_DELAY: int = 3  # base delay in seconds
+RETRY_DELAY: int = 3
 breaker_get = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60)
 breaker_post = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60)
+last_breaker_reset = time.time()
+BREAKER_RESET_INTERVAL = 300  # 5 minutes
 
-# Special case constants for Solana Pump.Fun tokens
+# Special Cases
 PUMPFUN_UPDATE_AUTHORITY: str = "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM"
 
-# Supabase table configuration
+# Supabase Configuration
 TOKENS_TO_CHECK_TABLE: str = "tokens_to_check"
 TOKEN_CHECKS_TABLE: str = "token_checks"
 CHECK_INTERVAL_SECONDS: int = 5
+RETRY_INTERVAL_1_SECONDS: int = 5 * 60
+RETRY_INTERVAL_2_SECONDS: int = 15 * 60
+MAX_RETRIES: int = 1
 
-# Graceful shutdown flag
+# Global State
 shutdown_flag = False
 
-
 # ------------------------------------------------------------------------------
-# Utility Functions
+# Core Functions
 # ------------------------------------------------------------------------------
 def validate_supabase_connection() -> None:
-    """Validate Supabase connection at startup."""
+    """Validates Supabase connection."""
     try:
         response = supabase.table(TOKENS_TO_CHECK_TABLE).select("count", count="exact").execute()
         if response.count >= 0:
@@ -139,35 +149,25 @@ def validate_supabase_connection() -> None:
         logger.critical(f"Supabase connection failed: {e}")
         exit(1)
 
-
 def handle_signal(signum, frame):
-    """Handle SIGTERM/SIGINT for graceful shutdown."""
+    """Handles shutdown signals for graceful termination."""
     global shutdown_flag
     shutdown_flag = True
     logger.info("Shutdown signal received. Finishing current work...")
 
-
 signal.signal(signal.SIGTERM, handle_signal)
 signal.signal(signal.SIGINT, handle_signal)
 
-
 def cleanup():
-    """Cleanup resources on exit."""
+    """Cleans up resources before exiting."""
     if supabase:
         supabase.auth.sign_out()
     logger.info("Cleanup completed.")
 
-
 atexit.register(cleanup)
 
-
 def load_config() -> Dict[str, Any]:
-    """
-    Load QuickIntel configuration from a JSON file.
-
-    Returns:
-        Dict[str, Any]: Configuration dictionary containing 'user_address' and 'tier'.
-    """
+    """Loads QuickIntel API configuration from JSON file."""
     try:
         with open(CONFIG_FILE, "r") as f:
             config: Dict[str, Any] = json.load(f)
@@ -180,15 +180,12 @@ def load_config() -> Dict[str, Any]:
     except json.JSONDecodeError as e:
         logger.critical(f"Invalid JSON format in {CONFIG_FILE}: {e}")
         raise
-
+    except Exception as e:
+        logger.critical(f"An unexpected error occurred: {e}")
+        raise
 
 def configure_session() -> Session:
-    """
-    Create a requests Session with retry logic and cookie handling.
-
-    Returns:
-        Session: A configured requests session with retry/backoff behavior.
-    """
+    """Configures requests Session with retry logic and cookie handling."""
     session: Session = Session()
     retries = Retry(
         total=RETRY_ATTEMPTS,
@@ -203,14 +200,8 @@ def configure_session() -> Session:
     session.cookies = cookie_jar
     return session
 
-
 def get_headers() -> Dict[str, str]:
-    """
-    Generate request headers for the QuickIntel API.
-
-    Returns:
-        Dict[str, str]: A dictionary containing standard headers.
-    """
+    """Generates request headers for QuickIntel API calls."""
     return {
         "User-Agent": USER_AGENT,
         "Accept": "/",
@@ -222,21 +213,9 @@ def get_headers() -> Dict[str, str]:
         "Priority": "u=0",
     }
 
-
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
 def api_get_with_retries(url: str, params: Dict[str, Any], chain: str, timeout: int = 30) -> Optional[Any]:
-    """
-    Perform a GET request with retries, exponential backoff, and a circuit breaker.
-
-    Args:
-        url (str): The API endpoint URL.
-        params (Dict[str, Any]): Query parameters for the GET request.
-        chain (str): The blockchain chain identifier.
-        timeout (int): Timeout for the request in seconds.
-
-    Returns:
-        Optional[Any]: JSON response or None if all retries fail.
-    """
+    """Performs a GET request with retry and circuit breaker."""
     GET_REQUEST_COUNTER.labels(endpoint=url, chain=chain).inc()
     for attempt in range(RETRY_ATTEMPTS):
         try:
@@ -246,40 +225,26 @@ def api_get_with_retries(url: str, params: Dict[str, Any], chain: str, timeout: 
                 )
                 response.raise_for_status()
                 return response.json()
-        except HTTPError as e:  # Catch HTTPError specifically
+        except HTTPError as e:
             API_ERROR_COUNTER.labels(endpoint=url, chain=chain).inc()
             if e.response.status_code == 404:
-                logger.warning(f"Honeypot API 404 for {url} (token: {params.get('address')}, chain: {chain}). Data not found by Honeypot.")
+                logger.warning(f"Honeypot API 404 for {url} (token: {params.get('address')}, chain: {chain})")
             else:
-                logger.error(f"Error on GET {url} attempt {attempt+1}: {e}") # General error logging remains
+                logger.error(f"Error on GET {url} attempt {attempt+1}: {e}")
             if attempt < RETRY_ATTEMPTS - 1:
                 time.sleep(RETRY_DELAY * (2 ** attempt))
-        except Exception as e: # Catch other exceptions
+        except Exception as e:
             API_ERROR_COUNTER.labels(endpoint=url, chain=chain).inc()
             logger.error(f"Error on GET {url} attempt {attempt+1}: {e}")
             if attempt < RETRY_ATTEMPTS - 1:
                 time.sleep(RETRY_DELAY * (2 ** attempt))
     return None
 
-
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
 def api_post_with_retries(
     url: str, headers: Dict[str, str], data: str, session: Session, chain: str, timeout: int = 30
 ) -> Optional[Any]:
-    """
-    Perform a POST request with retries, exponential backoff, and a circuit breaker.
-
-    Args:
-        url (str): The API endpoint URL.
-        headers (Dict[str, str]): Request headers.
-        data (str): JSON string data to send in the request body.
-        session (Session): The configured requests session.
-        chain (str): The blockchain chain identifier.
-        timeout (int): Timeout for the request in seconds.
-
-    Returns:
-        Optional[Any]: JSON response or None if all retries fail.
-    """
+    """Performs a POST request with retry and circuit breaker."""
     POST_REQUEST_COUNTER.labels(endpoint=url, chain=chain).inc()
     for attempt in range(RETRY_ATTEMPTS):
         try:
@@ -297,17 +262,8 @@ def api_post_with_retries(
                 time.sleep(RETRY_DELAY * (2 ** attempt))
     return None
 
-
 def extract_function_names(func_list: Optional[List[Any]]) -> List[str]:
-    """
-    Extract function names from a list of Solidity function strings.
-
-    Args:
-        func_list (Optional[List[Any]]): A list of function definitions as strings.
-
-    Returns:
-        List[str]: A list of extracted function names.
-    """
+    """Extracts function names from a list of Solidity function strings."""
     names: List[str] = []
     if func_list and isinstance(func_list, list):
         for func in func_list:
@@ -316,296 +272,296 @@ def extract_function_names(func_list: Optional[List[Any]]) -> List[str]:
                 names.append(match.group(1).strip())
     return names
 
-
 def apply_special_cases(
     quickintel_result: Dict[str, Any], chain: str, raw_data: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Apply special-case rules to QuickIntel results, e.g. for Solana Pump.Fun tokens.
+    """Applies chain-specific special case rules to QuickIntel results."""
+    quickintel_result["specialCaseMessage"] = None # Initialize specialCaseMessage
 
-    Args:
-        quickintel_result (Dict[str, Any]): The QuickIntel result object to modify.
-        chain (str): The blockchain chain identifier (e.g., 'solana').
-        raw_data (Dict[str, Any]): The raw QuickIntel API response.
-
-    Returns:
-        Dict[str, Any]: The possibly modified QuickIntel result.
-    """
-    # Existing Solana Pump.Fun special case
+    # Pump.Fun special case
     if chain == "solana":
         audit: Dict[str, Any] = raw_data.get("quickiAudit") or {}
         authorities: Dict[str, Any] = audit.get("authorities") or {}
         if authorities.get("update_Authority") == PUMPFUN_UPDATE_AUTHORITY:
-            quickintel_result["specialCase"] = "pumpFun"
-            quickintel_result["status"] = "good"
-            quickintel_result["message"] = "Passed Pump.Fun special case"
-            quickintel_result["findings"] = []
+            quickintel_result.update({
+                "specialCase": "pumpFun",
+                "status": "good",
+                "message": "Passed Pump.Fun special case",
+                "findings": []
+            })
+            quickintel_result["specialCaseMessage"] = "pumpFun token"
 
-    # New Base Bankr special case
+    # Base Bankr special case
     if chain == "base":
         audit: Dict[str, Any] = raw_data.get("quickiAudit") or {}
-        contract_creator: str = audit.get("contract_Creator", "")
-        contract_name: str = audit.get("contract_Name", "")
-        if (
-            contract_creator == "0x002f07b0d63e8ac14f8ef6b73ccd8caf1fef074c"
-            or contract_name == "ClankerToken"
-        ):
-            quickintel_result["specialCase"] = "baseBankr"
-            quickintel_result["status"] = "good"
-            quickintel_result["message"] = "Passed Base Bankr special case"
-            quickintel_result["findings"] = []
+        contract_creator = audit.get("contract_Creator", "")
+        contract_name = audit.get("contract_Name", "")
+        if contract_creator == "0x002f07b0d63e8ac14f8ef6b73ccd8caf1fef074c" or contract_name == "ClankerToken":
+            quickintel_result.update({
+                "specialCase": "baseBankr",
+                "status": "good",
+                "message": "Passed Base Bankr special case",
+                "findings": []
+            })
+            quickintel_result["specialCaseMessage"] = "baseBankr token"
 
-    # New Moonshot special case
+    # Moonshot special case
     if chain in {"base", "abstract"}:
         audit: Dict[str, Any] = raw_data.get("quickiAudit") or {}
-        contract_name: str = audit.get("contract_Name", "")
+        contract_name = audit.get("contract_Name", "")
         token_details: Dict[str, Any] = raw_data.get("tokenDetails") or {}
-        token_logo: str = token_details.get("tokenLogo", "")
-        if contract_name == "MoonshotToken" and token_logo.startswith(
-            "https://cdn.dexscreener.com/"
-        ):
-            quickintel_result["specialCase"] = "moonshot"
-            quickintel_result["status"] = "good"
-            quickintel_result["message"] = "Passed Moonshot special case"
-            quickintel_result["findings"] = []
+        token_logo = str(token_details.get("tokenLogo", ""))
+        if contract_name == "MoonshotToken" and token_logo.startswith("https://cdn.dexscreener.com/"):
+            quickintel_result.update({
+                "specialCase": "moonshot",
+                "status": "good",
+                "message": "Passed Moonshot special case",
+                "findings": []
+            })
+            quickintel_result["specialCaseMessage"] = "moonshot token"
 
     return quickintel_result
 
-
 # ------------------------------------------------------------------------------
-# Supabase Data Interaction Functions
+# Supabase Operations
 # ------------------------------------------------------------------------------
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
-def fetch_unchecked_tokens_from_supabase() -> List[Dict[str, Any]]:
-    """
-    Fetch tokens with 'unchecked' status from the Supabase 'tokens_to_check' table.
-
-    Returns:
-        List[Dict[str, Any]]: A list of token dictionaries, or an empty list if no tokens are found or an error occurs.
-    """
-    logger.info("Fetching 'unchecked' tokens from Supabase...")
+def fetch_tokens_for_processing_from_supabase() -> List[Dict[str, Any]]:
+    """Fetches tokens for processing from Supabase."""
+    logger.info("Fetching tokens for processing from Supabase...")
     try:
-        SUPABASE_REQUEST_COUNTER.labels(operation="select_unchecked_tokens").inc()
-        response = supabase.table(TOKENS_TO_CHECK_TABLE).select("*").eq("status", "unchecked").execute()
-        if response.data is None:  # Correctly check for errors using response.data
-            SUPABASE_ERROR_COUNTER.labels(operation="select_unchecked_tokens").inc()
-            logger.error(f"Supabase query error fetching 'unchecked' tokens: {response.error}")
+        SUPABASE_REQUEST_COUNTER.labels(operation="select_tokens_for_processing").inc()
+        response = supabase.table(TOKENS_TO_CHECK_TABLE).select("*").in_("status", ["unchecked", "undetermined"]).execute()
+        if response.data is None:
+            SUPABASE_ERROR_COUNTER.labels(operation="select_tokens_for_processing").inc()
+            logger.error(f"Supabase query error: {response.error}")
             return []
-        tokens: List[Dict[str, Any]] = response.data
-        logger.info(f"Successfully fetched {len(tokens)} 'unchecked' tokens from Supabase.")
-        return tokens
+        return response.data
     except Exception as e:
-        SUPABASE_ERROR_COUNTER.labels(operation="select_unchecked_tokens").inc()
-        logger.error(f"Error fetching 'unchecked' tokens from Supabase: {e}")
+        SUPABASE_ERROR_COUNTER.labels(operation="select_tokens_for_processing").inc()
+        logger.error(f"Error fetching tokens: {e}")
         return []
-
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
 def update_token_status_to_checked(token_address: str, chain: str) -> bool:
-    """
-    Update the status of a token in the Supabase 'tokens_to_check' table to 'checked'.
-
-    Args:
-        token_address (str): The address of the token.
-        chain (str): The blockchain chain of the token.
-
-    Returns:
-        bool: True if the status was successfully updated, False otherwise.
-    """
-    logger.info(f"Updating status to 'checked' for token: {token_address} on chain: {chain} in Supabase...")
+    """Updates token status to 'checked' in Supabase."""
+    logger.info(f"Updating {token_address} on {chain} to checked")
     try:
-        SUPABASE_REQUEST_COUNTER.labels(operation="update_token_status").inc()
-        response = supabase.table(TOKENS_TO_CHECK_TABLE).update({"status": "checked"}).eq("token_address", token_address).eq("chain", chain).execute()
-        if response.data is None:  # Correctly check for errors using response.data
-            SUPABASE_ERROR_COUNTER.labels(operation="update_token_status").inc()
-            logger.error(f"Supabase update error for token {token_address} on {chain}: {response.error}")
-            return False
-        logger.info(f"Successfully updated status to 'checked' for token: {token_address} on chain: {chain} in Supabase.")
-        return True
+        SUPABASE_REQUEST_COUNTER.labels(operation="update_token_status_checked").inc()
+        response = supabase.table(TOKENS_TO_CHECK_TABLE).update(
+            {"status": "checked", "last_checked": "now()"}
+        ).eq("token_address", token_address).eq("chain", chain).execute()
+        return response.data is not None
     except Exception as e:
-        SUPABASE_ERROR_COUNTER.labels(operation="update_token_status").inc()
-        logger.error(f"Error updating status for token {token_address} on {chain} in Supabase: {e}")
+        SUPABASE_ERROR_COUNTER.labels(operation="update_token_status_checked").inc()
+        logger.error(f"Update failed: {e}")
         return False
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
+def update_token_status_to_undetermined(token_address: str, chain: str, retry_count: int) -> bool:
+    """Updates token status to 'undetermined' and increments retry count."""
+    logger.info(f"Marking {token_address} on {chain} as undetermined (retry {retry_count})")
+    try:
+        SUPABASE_REQUEST_COUNTER.labels(operation="update_token_status_undetermined").inc()
+        response = supabase.table(TOKENS_TO_CHECK_TABLE).update({
+            "status": "undetermined",
+            "retry_count": retry_count,
+            "last_retry_timestamp": "now()"
+        }).eq("token_address", token_address).eq("chain", chain).execute()
+        return response.data is not None
+    except Exception as e:
+        SUPABASE_ERROR_COUNTER.labels(operation="update_token_status_undetermined").inc()
+        logger.error(f"Update failed: {e}")
+        return False
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
+def update_token_status_to_bad(token_address: str, chain: str) -> bool:
+    """Updates token status to 'bad'."""
+    logger.info(f"Marking {token_address} on {chain} as bad")
+    try:
+        SUPABASE_REQUEST_COUNTER.labels(operation="update_token_status_bad").inc()
+        response = supabase.table(TOKENS_TO_CHECK_TABLE).update({
+            "status": "bad",
+            "last_checked": "now()"
+        }).eq("token_address", token_address).eq("chain", chain).execute()
+        return response.data is not None
+    except Exception as e:
+        SUPABASE_ERROR_COUNTER.labels(operation="update_token_status_bad").inc()
+        logger.error(f"Update failed: {e}")
+        return False
 
 # ------------------------------------------------------------------------------
-# Honeypot & QuickIntel Processing
+# Token Processing
 # ------------------------------------------------------------------------------
 def process_honeypot(token_address: str, chain: str) -> Dict[str, Any]:
-    """
-    Call both Honeypot endpoints and return validation data about the token.
-
-    Args:
-        token_address (str): The contract address of the token to check.
-        chain (str): The blockchain chain identifier.
-
-    Returns:
-        Dict[str, Any]: A dictionary containing contract verification and honeypot status.
-    """
+    """Analyzes token for honeypot characteristics using Honeypot APIs."""
     result: Dict[str, Any] = {}
-    params: Dict[str, str] = {"address": token_address}
+    params = {"address": token_address}
 
-    # ContractVerification endpoint
+    # Contract Verification check
     cv = api_get_with_retries(HONEYPOT_CV_URL, params, chain)
-    if cv:
-        cv_valid = (
-            cv.get("isRootOpenSource") is True
-            and cv.get("summary", {}).get("hasProxyCalls") is False
-            and cv.get("summary", {}).get("isOpenSource") is True
-        )
-        result["ContractVerification"] = {
-            "isRootOpenSource": cv.get("isRootOpenSource"),
-            "hasProxyCalls": cv.get("summary", {}).get("hasProxyCalls"),
-            "isOpenSource": cv.get("summary", {}).get("isOpenSource"),
-            "valid": cv_valid,
-            "message": "Contract Verification Passed"
-            if cv_valid
-            else "Contract Verification Failed", # More descriptive message
-        }
-    else:
-        result["ContractVerification"] = {"valid": False, "message": "Honeypot API: No Contract Verification data found for this token."} # Improved message
+    cv_valid = (
+        cv.get("isRootOpenSource") is True
+        and cv.get("summary", {}).get("hasProxyCalls") is False
+        and cv.get("summary", {}).get("isOpenSource") is True
+    ) if cv else False
+    result["ContractVerification"] = {
+        "valid": cv_valid,
+        "message": "Verified" if cv_valid else "Verification failed"
+    }
 
-    # IsHoneypot endpoint
+    # Honeypot check
     ih = api_get_with_retries(HONEYPOT_IH_URL, params, chain)
     if ih:
-        is_honeypot = ih.get("honeypotResult", {}).get("isHoneypot")
-        siphoned = ih.get("holderAnalysis", {}).get("siphoned", "")
-        simulation_success = ih.get("simulationSuccess")
-        flags = ih.get("summary", {}).get("flags", [])
+        holder_analysis = ih.get("holderAnalysis", {})
+        siphoned = int(holder_analysis.get("siphoned", "0") or 0)
         ih_valid = (
-            is_honeypot is False
-            and siphoned == "0"
-            and simulation_success is True
-            and not flags
-        )
-        message = (
-            "Honeypot Check Passed" # Improved message
-            if ih_valid
-            else f"Honeypot Check Failed: Token is a honeypot. Reason: {ih.get('honeypotResult', {}).get('honeypotReason', '')}" # More descriptive
+            ih.get("honeypotResult", {}).get("isHoneypot") is False
+            and siphoned == 0
+            and ih.get("simulationSuccess") is True
+            and not ih.get("summary", {}).get("flags", [])
         )
         result["IsHoneypot"] = {
-            "isHoneypot": is_honeypot,
-            "honeypotReason": ih.get("honeypotResult", {}).get("honeypotReason", ""),
-            "siphoned": siphoned,
-            "simulationSuccess": simulation_success,
-            "flags": flags,
             "valid": ih_valid,
-            "message": message,
+            "message": "Clean" if ih_valid else "Potential honeypot"
         }
     else:
-        result["IsHoneypot"] = {"valid": False, "message": "Honeypot API: No IsHoneypot data found for this token."} # Improved message
+        result["IsHoneypot"] = {"valid": False, "message": "No response"}
 
-    overall_valid = (
-        result["ContractVerification"].get("valid")
-        and result["IsHoneypot"].get("valid")
-    )
-    result["status"] = "good" if overall_valid else "bad"
+    result["status"] = "good" if all([
+        result["ContractVerification"]["valid"],
+        result["IsHoneypot"]["valid"]
+    ]) else "bad"
+
     return result
-
 
 def process_quickintel(
     token_address: str, chain: str, config: Dict[str, Any], session: Session
 ) -> Dict[str, Any]:
-    """
-    Call QuickIntel API and return relevant validation data, with detailed findings.
+    """Processes token analysis using QuickIntel API."""
+    payload = json.dumps({
+        "chain": chain,
+        "tokenAddress": token_address,
+        "userAddress": config["user_address"],
+        "tier": config["tier"]
+    })
 
-    Args:
-        token_address (str): The contract address of the token to check.
-        chain (str): The blockchain chain identifier (e.g., 'eth', 'bsc').
-        config (Dict[str, Any]): Configuration dict containing user address and tier.
-        session (Session): A requests Session object for making POST calls.
-
-    Returns:
-        Dict[str, Any]: A dictionary containing QuickIntel validation results.
-    """
-    # Increase timeout for certain chains if needed
-    timeout: int = 30 if chain == "pulsechain" else 30
-
-    payload: str = json.dumps(
-        {
-            "chain": chain,
-            "tokenAddress": token_address,
-            "userAddress": config["user_address"],
-            "tier": config["tier"],
-        }
+    data = api_post_with_retries(
+        QUICKINTEL_API_URL,
+        get_headers(),
+        payload,
+        session,
+        chain,
+        timeout=QUICKINTEL_API_TIMEOUT_SECONDS
     )
-    data: Optional[Dict[str, Any]] = api_post_with_retries(
-        QUICKINTEL_API_URL, get_headers(), payload, session, chain, timeout=timeout
-    )
+
     if not data:
-        logger.error(f"No response from QuickIntel for token {token_address}")
         return {
-            "valid": False,
-            "message": "QuickIntel API: No response received.", # Improved message
-            "findings": [],
-            "fetchStatus": "failed",
+            "status": "failed",
+            "message": "API request failed",
+            "findings": []
         }
 
-    # Extract basic token details
-    token_details: Dict[str, Any] = data.get("tokenDetails") or {}
-    details: Dict[str, Any] = {
-        "tokenName": token_details.get("tokenName"),
-        "tokenSymbol": token_details.get("tokenSymbol"),
-        "tokenOwner": token_details.get("tokenOwner"),
-        "tokenCreatedDate": token_details.get("tokenCreatedDate"),
-        "tokenSupply": token_details.get("tokenSupply"),
+    # Initialize results
+    result = {
+        "tokenDetails": {},
+        "taxes": {},
+        "status": "good",
+        "findings": [],
+        "contractLinks": [],
+        "extractedFunctions": {}
     }
 
-    # Validate tokenDynamicDetails
-    dyn: Dict[str, Any] = data.get("tokenDynamicDetails") or {}
+    # Process token details
+    token_details = data.get("tokenDetails", {})
+    result["tokenDetails"] = {
+        "name": token_details.get("tokenName"),
+        "symbol": token_details.get("tokenSymbol"),
+        "supply": token_details.get("tokenSupply"),
+        "owner": token_details.get("tokenOwner")
+    }
+
+    # Check root-level critical fields
+    root_critical_fields = {
+        "isAirdropPhishingScam": (False, "Phishing scam detected"),
+        "contractVerified": (True, "Unverified contract")
+    }
+
+    for field, (expected, msg) in root_critical_fields.items():
+        value = data.get(field)
+        if value is None:
+            result["findings"].append(f"Missing {field} data")
+            result["status"] = "undetermined"
+        elif value != expected:
+            result["findings"].append(msg)
+            result["status"] = "bad"
+
+    # Process dynamic details and tax checks
+    dyn = data.get("tokenDynamicDetails", {})
     dyn_findings: List[str] = []
+    tax_valid: bool = True
+
     try:
         buy_tax: float = float(dyn.get("buy_Tax") or 0)
-        see_tax: float = float(dyn.get("see_Tax") or 0)
+        sell_tax: float = float(dyn.get("sell_Tax") or 0)
         transfer_tax: float = float(dyn.get("transfer_Tax") or 0)
     except (ValueError, TypeError):
-        buy_tax = see_tax = transfer_tax = 0
+        buy_tax = sell_tax = transfer_tax = 0
 
     if dyn.get("is_Honeypot") is not False:
-        dyn_findings.append("Dynamic Details: is_Honeypot is not False") # More context in findings
+        dyn_findings.append("Dynamic Details: is_Honeypot is not False")
+        result["status"] = "bad"
+
     if buy_tax > 5:
-        dyn_findings.append("Dynamic Details: buy_Tax exceeds 5%") # More context in findings
-    if see_tax > 5:
-        dyn_findings.append("Dynamic Details: see_Tax exceeds 5%") # More context in findings
+        dyn_findings.append("Dynamic Details: buy_Tax exceeds 5%")
+        tax_valid = False
+    if sell_tax > 5:
+        dyn_findings.append("Dynamic Details: sell_Tax exceeds 5%")
+        tax_valid = False
     if transfer_tax > 5:
-        dyn_findings.append("Dynamic Details: transfer_Tax exceeds 5%") # More context in findings
-    if data.get("isAirdropPhishingScam") is not False:
-        dyn_findings.append("Dynamic Details: isAirdropPhishingScam is not False") # More context in findings
-    if data.get("contractVerified") is not True:
-        dyn_findings.append("Dynamic Details: contractVerified is not True") # More context in findings
+        dyn_findings.append("Dynamic Details: transfer_Tax exceeds 5%")
+        tax_valid = False
 
-    dyn_valid: bool = len(dyn_findings) == 0
+    if not tax_valid:
+        result["status"] = "bad"
 
-    # Validate quickiAudit
-    audit: Dict[str, Any] = data.get("quickiAudit") or {}
-    audit_findings: List[str] = []
-    if "contract_Renounced" in audit and audit["contract_Renounced"] is not True:
-        audit_findings.append("Audit: contract_Renounced is not True") # More context in findings
-    if "hidden_Owner" in audit and audit["hidden_Owner"] is not False:
-        audit_findings.append("Audit: hidden_Owner is not False") # More context in findings
-    if "is_Proxy" in audit and audit["is_Proxy"] is not False:
-        audit_findings.append("Audit: is_Proxy is not False") # More context in findings
+    result["taxes"] = {
+        "buy": buy_tax,
+        "sell": sell_tax,
+        "transfer": transfer_tax
+    }
+    result["findings"].extend(dyn_findings)
 
-    # Additional validations
-    if "has_Scams" not in audit:
-        audit_findings.append(
-            "Audit: Validation passed for has_Scams due to missing data from API." # More context in findings
-        )
-    elif audit.get("has_Scams") is not False:
-        audit_findings.append("Audit: has_Scams is not False (potential scam history detected)") # More context in findings
+    # Process audit data and audit checks
+    audit = data.get("quickiAudit", {})
+    audit_checks = {
+        "contract_Renounced": (True, "Contract not renounced"),
+        "hidden_Owner": (False, "Hidden owner detected"),
+        "is_Proxy": (False, "Proxy contract detected")
+    }
 
-    if "has_Known_Scam_Wallet_Funding" not in audit:
-        audit_findings.append(
-            "Audit: Validation passed for has_Known_Scam_Wallet_Funding due to missing data from API." # More context in findings
-        )
-    elif audit.get("has_Known_Scam_Wallet_Funding") is not False:
-        audit_findings.append(
-            "Audit: has_Known_Scam_Wallet_Funding is not False (funded by known scam wallets)" # More context in findings
-        )
+    for field, (expected, msg) in audit_checks.items():
+        value = audit.get(field)
+        if value is None:
+            result["findings"].append(f"Missing {field} data")
+            result["status"] = "undetermined"
+        elif value != expected:
+            result["findings"].append(msg)
+            result["status"] = "bad"
 
-    audit_valid: bool = len(audit_findings) == 0
+    # Scam history checks (for configurable chains)
+    if chain in SCAM_CHECK_CHAINS:
+        if "has_Scams" not in audit:
+            result["findings"].append("Audit: Validation passed for has_Scams due to missing data from API.")
+        elif audit.get("has_Scams") is not False:
+            result["findings"].append("Audit: has_Scams is not False")
 
-    # Extract function names
+        if "has_Known_Scam_Wallet_Funding" not in audit:
+            result["findings"].append("Audit: Validation passed for has_Known_Scam_Wallet_Funding due to missing data from API.")
+        elif audit.get("has_Known_Scam_Wallet_Funding") is not False:
+            result["findings"].append("Audit: has_Known_Scam_Wallet_Funding is not False")
+
+    # Function name extraction for risk functions
     functions_to_extract: List[str] = [
         "modified_Transfer_Functions",
         "suspicious_Functions",
@@ -619,7 +575,17 @@ def process_quickintel(
         func_list = audit.get(key)
         extracted_functions[key] = extract_function_names(func_list)
 
-    # Categorize contract links
+    # Extract all contract functions from 'functions' field
+    functions_list = audit.get("functions")
+    if isinstance(functions_list, list):
+        extracted_functions["contract_functions"] = functions_list
+    else:
+       # logger.warning(f"Unexpected data type for 'functions' field in QuickIntel API response. Expected list, got: {type(functions_list)}")
+        extracted_functions["contract_functions"] = []
+
+    result["extractedFunctions"] = extracted_functions
+
+    # Contract link categorization
     links: List[Any] = audit.get("contract_Links") or []
     categorized_links: Dict[str, List[str]] = {
         "Telegram": [],
@@ -638,179 +604,157 @@ def process_quickintel(
             else:
                 categorized_links["Other Links"].append(url)
 
-    # Determine overall validation status
-    overall_valid: bool = dyn_valid and audit_valid
-    all_findings: List[str] = []
-    if not dyn_valid:
-        all_findings.extend(dyn_findings)
-    if not audit_valid:
-        all_findings.extend(audit_findings)
+    result["contractLinks"] = categorized_links
 
-    result: Dict[str, Any] = {
-        "tokenDetails": details,
-        "tokenDynamicDetailsValid": dyn_valid,
-        "quickiAuditValid": audit_valid,
-        "extractedFunctions": extracted_functions,
-        "contractLinks": categorized_links,
-        "status": "good" if overall_valid else "bad",
-        "message": "QuickIntel Validation Passed" if overall_valid else "QuickIntel Validation Failed", # Improved message
-        "findings": all_findings,
-    }
-
-    # Apply any chain-specific special cases (e.g., Pump.Fun)
+    # Apply special cases before final status determination
     result = apply_special_cases(result, chain, data)
+
+    # Special case override
+    if result.get("specialCase"):
+        result["status"] = "good"
+        result["findings"] = []
+
     return result
 
-
-# ------------------------------------------------------------------------------
-# Token Processing (Fetching from Supabase and Storing results in Supabase)
-# ------------------------------------------------------------------------------
 def process_token(token: Dict[str, Any], config: Dict[str, Any], session: Session) -> Dict[str, Any]:
-    """
-    Process a single token by calling Honeypot/QuickIntel APIs and then storing
-    the results in Supabase. Fetches token data from Supabase 'tokens_to_check' table.
-
-    Args:
-        token (Dict[str, Any]): A dictionary containing 'token_address' and 'chain' keys from Supabase.
-        config (Dict[str, Any]): QuickIntel configuration dict (contains user_address, tier).
-        session (Session): Configured requests session for API calls.
-
-    Returns:
-        Dict[str, Any]: A result entry summarizing the token analysis and status.
-    """
-    token_address: str = token.get("token_address", "")  # Use 'token_address' from Supabase record
-    chain: str = token.get("chain", "").lower()  # Use 'chain' from Supabase record
-
-    # Initialize a result entry for local usage/logging
-    result_entry: Dict[str, Union[str, Dict[str, Any], List[str]]] = {
+    """Processes a single token by performing honeypot and QuickIntel analysis."""
+    token_address = token.get("token_address", "")
+    chain = token.get("chain", "").lower()
+    retry_count = token.get("retry_count", 0)
+    result = {
         "address": token_address,
         "chain": chain,
-        "status": "good",
-        "honeypot": None,
-        "quickintel": None,
-        "errors": [],
+        "status": "unprocessed",
+        "honeypot": {},
+        "quickintel": {},
+        "errors": []
     }
 
-    overall_valid: bool = True
-
     try:
-        # Honeypot check (if chain is supported by the Honeypot API)
+        # Honeypot Check Block
         if chain in HONEYPOT_CHAINS:
-            honeypot_result: Dict[str, Any] = process_honeypot(token_address, chain)
-            result_entry["honeypot"] = honeypot_result
-            if honeypot_result.get("status") != "good":
-                overall_valid = False
+            honeypot_result = process_honeypot(token_address, chain)
         else:
-            result_entry["honeypot"] = f"Not applicable for chain {chain}"
-
-        # QuickIntel check
-        quickintel_result: Dict[str, Any] = process_quickintel(
-            token_address, chain, config, session
-        )
-        result_entry["quickintel"] = quickintel_result
-
-        # Determine final status
-        if quickintel_result.get("fetchStatus") == "failed":
-            overall_valid = False
-            result_entry["status"] = "failed"
-        elif quickintel_result.get("status") != "good":
-            overall_valid = False
-
-        # Update final status
-        if result_entry["status"] != "failed":
-            result_entry["status"] = "good" if overall_valid else "bad"
-
-        # Insert the analysis into Supabase
-        supabase.table(TOKEN_CHECKS_TABLE).insert(
-            {
-                "token_address": token_address,
-                "chain": chain,
-                "analysis_data": {
-                    "honeypot": result_entry["honeypot"],
-                    "quickintel": result_entry["quickintel"],
-                    "status": result_entry["status"],
-                },
-                "status": result_entry["status"],
+            honeypot_result = {
+                "status": "not_applicable",
+                "message": f"Honeypot check not supported for {chain}"
             }
-        ).execute()
-        SUPABASE_REQUEST_COUNTER.labels(operation="insert_token_checks").inc() # Add metrics for supabase insert
+        result["honeypot"] = honeypot_result
+
+        # QuickIntel Processing
+        if chain in QUICKINTEL_SUPPORTED_CHAINS:
+            quickintel_result = process_quickintel(token_address, chain, config, session)
+        else:
+            quickintel_result = {
+                "status": "not_supported",
+                "message": f"QuickIntel API does not support chain: {chain}",
+                "findings": [],
+                "extractedFunctions": {},
+                "contractLinks": []
+            }
+        result["quickintel"] = quickintel_result
+
+        # Determine final status with priority
+        if quickintel_result["status"] == "failed":
+            final_status = "bad"
+        elif honeypot_result.get("status") == "bad":
+            final_status = "bad"
+        elif quickintel_result["status"] == "undetermined" and retry_count < MAX_RETRIES:
+            final_status = "undetermined"
+        else:
+            final_status = quickintel_result["status"]
+
+        # Special case override
+        if quickintel_result.get("specialCase"):
+            final_status = "good"
+
+        # Update database based on final status
+        if final_status == "undetermined":
+            if retry_count >= MAX_RETRIES:
+                update_token_status_to_bad(token_address, chain)
+                final_status = "bad"
+            else:
+                update_token_status_to_undetermined(token_address, chain, retry_count + 1)
+        else:
+            update_token_status_to_checked(token_address, chain)
+
+        # Store analysis data in Supabase
+        analysis_data = {
+            "honeypot": honeypot_result,
+            "quickintel": {
+                "status": quickintel_result["status"],
+                "findings": quickintel_result["findings"],
+                "taxes": quickintel_result["taxes"],
+                "tokenDetails": quickintel_result["tokenDetails"],
+                "contractLinks": quickintel_result["contractLinks"],
+                "extractedFunctions": quickintel_result["extractedFunctions"],
+                "specialCaseMessage": quickintel_result.get("specialCaseMessage")
+            }
+        }
+
+        supabase.table(TOKEN_CHECKS_TABLE).insert({
+            "token_address": token_address,
+            "chain": chain,
+            "status": final_status,
+            "analysis_data": analysis_data
+        }).execute()
+
+        result["status"] = final_status
+        SUPABASE_REQUEST_COUNTER.labels(operation="insert_token_checks").inc()
 
     except Exception as e:
-        SUPABASE_ERROR_COUNTER.labels(operation="insert_token_checks").inc() # Add metrics for supabase insert error
         logger.error(f"Failed to process/store token {token_address}: {e}")
-        result_entry["status"] = "failed"
-        # Append the error message for local reference
-        errors_list = result_entry["errors"] if isinstance(result_entry["errors"], list) else []
-        errors_list.append(str(e))
-        result_entry["errors"] = errors_list
+        result["status"] = "failed"
+        result["errors"].append(str(e))
+        update_token_status_to_bad(token_address, chain)
+        SUPABASE_ERROR_COUNTER.labels(operation="insert_token_checks").inc()
 
-    return result_entry
-
+    return result
 
 # ------------------------------------------------------------------------------
-# Main Entry Point
+# Main Execution
 # ------------------------------------------------------------------------------
 def main() -> None:
-    """
-    Main function to:
-      1. Load config and initialize a requests Session.
-      2. Start Prometheus metrics server.
-      3. Periodically fetch 'unchecked' tokens from Supabase.
-      4. Process each token and store results in Supabase, updating token status to 'checked'.
-      5. Sleep for a defined interval before checking for new tokens again.
-    """
-    config: Optional[Dict[str, Any]] = None  # Initialize config outside the loop
-    session: Optional[Session] = None  # Initialize session outside the loop
+    """Main processing loop for token analysis."""
+    global last_breaker_reset
 
-    try:
-        config = load_config()
-        session = configure_session()
+    config = load_config()
+    session = configure_session()
+    validate_supabase_connection()
+    start_http_server(8000)
 
-        # Validate Supabase connection
-        validate_supabase_connection()
+    logger.info("Service started")
+    while not shutdown_flag:
+        # Circuit breaker automatic reset logging
+        if time.time() - last_breaker_reset > BREAKER_RESET_INTERVAL:
+            last_breaker_reset = time.time()
+            logger.info("Circuit breakers reset timeout period reached, allowing automatic reset attempt.")
 
-        # Start Prometheus metrics server
-        start_http_server(8000)
-        logger.info("Prometheus metrics server started on port 8000.")
+        tokens = fetch_tokens_for_processing_from_supabase()
 
-        while not shutdown_flag:
-            logger.info("Checking for new tokens to process...")
-            tokens_to_process: List[Dict[str, Any]] = fetch_unchecked_tokens_from_supabase()
+        for token in tokens:
+            token_address = token.get("token_address")
+            chain = token.get("chain")
+            status = token.get("status")
+            last_retry = token.get("last_retry_timestamp")
 
-            if not tokens_to_process:
-                logger.info("No 'unchecked' tokens found in Supabase. Sleeping...")
-            else:
-                logger.info(f"Found {len(tokens_to_process)} 'unchecked' tokens. Processing...")
-                for token in tokens_to_process:
-                    token_address = token.get("token_address")
-                    chain = token.get("chain")
-                    if token_address and chain:
-                        logger.info(f"Processing token: {token_address} on chain {chain}")
-                        process_token(token, config, session)  # Pass the token dictionary directly
-                        if update_token_status_to_checked(token_address, chain):
-                            logger.info(f"Successfully updated status to 'checked' for token: {token_address} on chain: {chain}.")
-                        else:
-                            logger.error(f"Failed to update status to 'checked' for token: {token_address} on chain: {chain}.")
-                    else:
-                        logger.error(f"Invalid token data received from Supabase: {token}. Skipping.")
+            if not token_address or not chain:
+                continue
 
-            logger.info(f"Sleeping for {CHECK_INTERVAL_SECONDS} seconds...")
-            time.sleep(CHECK_INTERVAL_SECONDS)
-            logger.info("Waking up and checking for new tokens again.")
+            # Handle retry timing for 'undetermined' tokens
+            if status == "undetermined" and last_retry:
+                last_retry_time = datetime.fromisoformat(last_retry.replace('Z', '+00:00'))
+                elapsed = (datetime.now(timezone.utc) - last_retry_time).total_seconds()
+                required_delay = RETRY_INTERVAL_1_SECONDS if token["retry_count"] < 1 else RETRY_INTERVAL_2_SECONDS
 
-    except KeyboardInterrupt:
-        logger.info("Token checker interrupted by user (KeyboardInterrupt). Shutting down gracefully...")
+                if elapsed < required_delay:
+                    continue
 
-    except Exception as e:
-        logger.critical(f"Fatal error in main loop: {e}", exc_info=True)
+            process_token(token, config, session)
 
-    finally:
-        if session:
-            session.close()
-            logger.info("Session closed.")
-        logger.info("Token checker loop finished.")
+        time.sleep(CHECK_INTERVAL_SECONDS)
 
+    logger.info("Service stopped")
 
-# Standard Python entry point
 if __name__ == "__main__":
     main()
