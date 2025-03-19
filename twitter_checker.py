@@ -2,7 +2,7 @@
 twitter_data_fetcher.py
 Fetches tweet data from SocialData API, processes it, and stores it in Supabase.
 Implements robust error handling, rate limiting, Prometheus metrics, and graceful shutdown.
-Utilizes a dynamic spam account blacklist and content exclusion filters for data refinement.
+Utilizes dynamic spam account and content exclusion filters, persistent HTTP sessions, and concurrent processing.
 """
 
 import os
@@ -15,6 +15,7 @@ import atexit
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Environment variable handling
 from dotenv import load_dotenv
@@ -27,25 +28,52 @@ import pybreaker
 # Prometheus Metrics Libraries
 from prometheus_client import start_http_server, Counter, Histogram
 from requests.exceptions import HTTPError
-from requests import Session
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # Supabase integration
 from supabase import create_client, Client
 
 # ------------------------------------------------------------------------------
-# Load environment variables
+# Configuration Constants
 # ------------------------------------------------------------------------------
 load_dotenv()
 
+# Environment credentials
 SUPABASE_URL: str = os.getenv("SUPABASE_URL")
 SUPABASE_KEY: str = os.getenv("SUPABASE_KEY")
 SOCIALDATA_API_KEY: str = os.getenv("SOCIALDATA_API_KEY")
-
 if not SUPABASE_URL or not SUPABASE_KEY or not SOCIALDATA_API_KEY:
     logging.critical("Missing Supabase or SocialData API credentials in .env")
     exit(1)
+
+# Prometheus Metrics Port
+PROMETHEUS_PORT: int = 8000
+
+# Twitter Data Filtering
+MIN_FAVES_THRESHOLD: int = 0
+MIN_RETWEETS_THRESHOLD: int = 0
+MIN_REPLIES_THRESHOLD: int = 0
+CONTENT_EXCLUSION_KEYWORDS: List[str] = [
+    "scam", "rug", "rugpull", "scammer", "scammers", "insider", "insiders",
+    "fake", "bundled", "warning", "alert", "avoid"
+]
+
+# Rate Limiting and Retry Settings
+RATE_LIMIT_BACKOFF_SECONDS: int = 5
+MAX_RATE_LIMIT_RETRIES: int = 3
+RETRY_INTERVAL_UNDETERMINED_MINUTES: int = 5
+RETRY_ATTEMPTS: int = 3
+RETRY_DELAY: int = 3
+
+# Circuit Breaker Settings (merged into one)
+CIRCUIT_BREAKER_FAIL_MAX: int = 5
+CIRCUIT_BREAKER_RESET_TIMEOUT: int = 60
+
+# Thread Pool for concurrent token processing
+THREAD_POOL_WORKERS: int = 10
+
+# Check interval and breaker reset interval (in seconds)
+CHECK_INTERVAL_SECONDS: int = 1
+BREAKER_RESET_INTERVAL: int = 300
 
 # ------------------------------------------------------------------------------
 # Prometheus Metrics Configuration
@@ -78,50 +106,37 @@ API_REQUEST_DURATION: Histogram = Histogram(
 LOG_FILENAME: str = "twitter_checker.log"
 logger: logging.Logger = logging.getLogger("TwitterChecker")
 logger.setLevel(logging.DEBUG)
-
-handler = RotatingFileHandler(LOG_FILENAME, maxBytes=10 * 1024 * 1024, backupCount=5)
+handler = RotatingFileHandler(LOG_FILENAME, maxBytes=1 * 1024 * 1024, backupCount=1)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 handler.setFormatter(formatter)
 handler.setLevel(logging.DEBUG)
 logger.addHandler(handler)
-
 logger.setLevel(logging.INFO)
 
 # ------------------------------------------------------------------------------
-# Configuration Constants
+# Global Variables and Initialization
 # ------------------------------------------------------------------------------
-MIN_FAVES_THRESHOLD: int = 1
-MIN_RETWEETS_THRESHOLD: int = 0
-MIN_REPLIES_THRESHOLD: int = 0
-CONTENT_EXCLUSION_KEYWORDS: List[str] = []
-RATE_LIMIT_BACKOFF_SECONDS: int = 5
-MAX_RATE_LIMIT_RETRIES: int = 3
-PROMETHEUS_PORT: int = 8000
-CHECK_INTERVAL_SECONDS: int = 1
-RETRY_INTERVAL_UNDETERMINED_MINUTES: int = 5
-
-# ------------------------------------------------------------------------------
-# Retry/Circuit Breaker Settings
-# ------------------------------------------------------------------------------
-RETRY_ATTEMPTS: int = 3
-RETRY_DELAY: int = 3
-breaker_get = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60)
-breaker_post = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60)
-socialdata_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60)
-last_breaker_reset = time.time()
-BREAKER_RESET_INTERVAL: int = 300
-
-# ------------------------------------------------------------------------------
-# Global State Variables
-# ------------------------------------------------------------------------------
+# Global shutdown flag for graceful exit
 is_shutting_down: bool = False
+
+# Initialize Supabase client variable (to be set in initialize_supabase_client)
+supabase_client: Optional[Client] = None
+
+# Initialize a persistent HTTP session
+http_session = requests.Session()
+
+# Initialize a single circuit breaker for all API calls
+breaker = pybreaker.CircuitBreaker(fail_max=CIRCUIT_BREAKER_FAIL_MAX, reset_timeout=CIRCUIT_BREAKER_RESET_TIMEOUT)
+
+# Variable to track the last circuit breaker reset time
+last_breaker_reset = time.time()
 
 # ------------------------------------------------------------------------------
 # Helper Functions
 # ------------------------------------------------------------------------------
 
 def validate_supabase_connection() -> None:
-    """Validates the connection to Supabase by selecting available columns from the tweets_data table."""
+    """Validates the connection to Supabase by performing a test query on the tweets_data table."""
     try:
         supabase_client.table("tweets_data").select("*", count="exact").limit(1).execute()
         logger.info("Supabase connection validated.")
@@ -132,9 +147,6 @@ def validate_supabase_connection() -> None:
 def initialize_supabase_client() -> None:
     """Initializes the Supabase client and validates the connection."""
     global supabase_client
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.critical("Missing Supabase URL or Key in environment variables.")
-        exit(1)
     supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
     if supabase_client:
         logger.info("Supabase client initialized and connection validated.")
@@ -144,7 +156,9 @@ def initialize_supabase_client() -> None:
         exit(1)
 
 def construct_socialdata_query(token_address: str, spam_accounts: List[str]) -> str:
-    """Constructs the SocialData API query string with token address and filters."""
+    """
+    Constructs the SocialData API query string.
+    """
     query = f'"{token_address}" -filter:retweets'
     encoded_query = quote_plus(query)
     logger.debug(f"Constructed SocialData API query: {encoded_query}")
@@ -152,16 +166,16 @@ def construct_socialdata_query(token_address: str, spam_accounts: List[str]) -> 
 
 @API_REQUEST_DURATION.time()
 @retry(stop=stop_after_attempt(RETRY_ATTEMPTS), wait=wait_exponential(multiplier=1, max=10))
-@breaker_get
+@breaker
 def fetch_twitter_data(query: str, api_key: str) -> Optional[Dict[str, Any]]:
-    """Fetches data from the SocialData API with retries, circuit breaker, and error handling."""
+    """Fetches data from the SocialData API using a persistent HTTP session, with retries and circuit breaker."""
     API_REQUESTS_TOTAL.inc()
     url = "https://api.socialdata.tools/twitter/search"
     headers = {'Authorization': f'Bearer {api_key}', 'Accept': 'application/json'}
     params = {'query': query, 'type': 'Latest'}
     logger.debug(f"SocialData API Request URL: {sanitize_url(url, params)}")
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=30)
+        response = http_session.get(url, headers=headers, params=params, timeout=30)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.HTTPError as e:
@@ -169,8 +183,7 @@ def fetch_twitter_data(query: str, api_key: str) -> Optional[Dict[str, Any]]:
         if e.response.status_code == 429:
             logger.warning(f"SocialData API rate limit hit, retrying after backoff. Error: {e}")
         elif e.response.status_code == 402:
-            logger.critical("SocialData API Payment Required (402). Tripping circuit breaker. Check API balance.")
-            socialdata_breaker.trip()
+            logger.critical("SocialData API Payment Required (402). Check API balance.")
             ERRORS_TOTAL.labels(type="socialdata_api_payment_required").inc()
         else:
             logger.error(f"SocialData API HTTP error: {e}")
@@ -185,12 +198,12 @@ def fetch_twitter_data(query: str, api_key: str) -> Optional[Dict[str, Any]]:
         return None
 
 def sanitize_url(url: str, params: Dict[str, str]) -> str:
-    """Sanitizes the URL to redact sensitive information from logs."""
+    """Sanitizes the URL by redacting sensitive parameter values from logs."""
     query_string = '&'.join([f"{k}=[REDACTED]" for k in params.keys()])
     return f"{url}?{query_string}"
 
 def calculate_time_elapsed_minutes(tweet_created_at_str: Optional[str]) -> int:
-    """Calculates minutes elapsed since the tweet was created."""
+    """Calculates the number of minutes elapsed since the tweet was created."""
     if not tweet_created_at_str:
         return 0
     try:
@@ -202,7 +215,7 @@ def calculate_time_elapsed_minutes(tweet_created_at_str: Optional[str]) -> int:
         return 0
 
 def calculate_engagement_score(tweet: Dict[str, Any]) -> int:
-    """Calculates the engagement score for a tweet."""
+    """Calculates the engagement score for a tweet by summing favorites, replies, retweets, and bookmarks."""
     favorite_count = tweet.get('favorite_count', 0)
     reply_count = tweet.get('reply_count', 0)
     retweet_count = tweet.get('retweet_count', 0)
@@ -210,11 +223,14 @@ def calculate_engagement_score(tweet: Dict[str, Any]) -> int:
     return favorite_count + reply_count + retweet_count + bookmark_count
 
 def tweet_link_constructor(screen_name: str, tweet_id_str: str) -> str:
-    """Constructs a direct link to a tweet."""
+    """Constructs a direct link to the tweet."""
     return f"https://x.com/{screen_name}/status/{tweet_id_str}"
 
 def process_tweet_data(api_response_data: Dict[str, Any], tweet_link_constructor, spam_accounts: List[str]) -> Tuple[Optional[Dict[str, Any]], Optional[List[str]], Optional[Dict[str, Any]]]:
-    """Processes API response to extract primary tweet data, filter tweets, and identify the primary tweet."""
+    """
+    Processes API response data by filtering out tweets from spam accounts or containing excluded keywords,
+    then selects the tweet with the highest engagement as the primary tweet.
+    """
     primary_tweet_data = None
     other_tweet_links = []
     primary_tweet_object = None
@@ -226,19 +242,23 @@ def process_tweet_data(api_response_data: Dict[str, Any], tweet_link_constructor
 
     filtered_tweets = []
     tweets = api_response_data.get('tweets', [])
+    # Filter tweets based on spam account and content exclusion
     for tweet in tweets:
-        if calculate_engagement_score(tweet) < (MIN_FAVES_THRESHOLD + MIN_RETWEETS_THRESHOLD + MIN_REPLIES_THRESHOLD):
-            continue
-        user_screen_name = tweet['user']['screen_name']
+        user_data = tweet.get('user', {})
+        user_screen_name = user_data.get('screen_name', '')
         if user_screen_name in spam_accounts:
             continue
-        if any(keyword.lower() in tweet['full_text'].lower() for keyword in CONTENT_EXCLUSION_KEYWORDS):
+        tweet_text = tweet.get('full_text', '').lower()
+        if any(keyword in tweet_text for keyword in CONTENT_EXCLUSION_KEYWORDS):
+            continue
+        if calculate_engagement_score(tweet) < (MIN_FAVES_THRESHOLD + MIN_RETWEETS_THRESHOLD + MIN_REPLIES_THRESHOLD):
             continue
         filtered_tweets.append(tweet)
 
     if not filtered_tweets:
         return None, None, None
 
+    # Select the primary tweet with the highest engagement score
     for tweet in filtered_tweets:
         tweet_id_str = tweet.get('id_str')
         tweet_created_at_str = tweet.get('tweet_created_at')
@@ -272,7 +292,7 @@ def process_tweet_data(api_response_data: Dict[str, Any], tweet_link_constructor
 
         other_tweet_links.append(tweet_link)
 
-    if primary_tweet_object:
+    if primary_tweet_object and primary_tweep_screen_name:
         other_tweet_links = [link for link in other_tweet_links if not link.startswith(f"https://x.com/{primary_tweep_screen_name}/status/")]
 
     return primary_tweet_data, other_tweet_links, primary_tweet_object
@@ -283,7 +303,7 @@ def process_tweet_data(api_response_data: Dict[str, Any], tweet_link_constructor
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
 def fetch_tokens_for_processing_from_supabase() -> List[Dict[str, Any]]:
-    """Fetches tokens from Supabase that are eligible for Twitter checks."""
+    """Fetches tokens eligible for Twitter checks from Supabase."""
     logger.info("Fetching tokens for Twitter check from Supabase (with retries)...")
     try:
         DB_OPERATIONS_TOTAL.labels(operation="select_tokens_for_twitter_check").inc()
@@ -304,13 +324,10 @@ def fetch_tokens_for_processing_from_supabase() -> List[Dict[str, Any]]:
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
 def fetch_spam_accounts_from_supabase(chain: str) -> List[str]:
-    """Fetches spam account usernames for a specific chain from Supabase.
-       Updated to query the modified chain column (text[]) using the 'cs' (contains) operator.
-    """
+    """Fetches spam account usernames for a given chain from Supabase using the array contains operator."""
     logger.debug(f"Fetching spam accounts for chain: {chain} from Supabase...")
     try:
         DB_OPERATIONS_TOTAL.labels(operation="select_spam_accounts").inc()
-        # Use the 'cs' operator to check if the chain array contains the given value.
         response = supabase_client.table("twitter_blacklists").select("username").filter("chain", "cs", f'{{"{chain}"}}').execute()
         if not response.data:
             SUPABASE_ERROR_COUNTER.labels(operation="select_spam_accounts").inc()
@@ -334,7 +351,6 @@ def save_tweet_data_to_supabase(token_address: str, name: str, primary_tweet_dat
             "primary_tweet_data": primary_tweet_data,
             "other_tweets_data": other_tweets_data
         }
-        logger.debug(f"Inserting data for token: {token_address} into Supabase...")
         response = supabase_client.table("tweets_data").insert(data_to_insert).execute()
         if not response.data:
             SUPABASE_ERROR_COUNTER.labels(operation="insert_tweet_data").inc()
@@ -351,7 +367,7 @@ def save_tweet_data_to_supabase(token_address: str, name: str, primary_tweet_dat
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
 def update_token_check_status_supabase(token_address: str, twitter_check_status: str) -> bool:
     """Updates the Twitter check status and last_checked timestamp in the token_checks table."""
-    logger.debug(f"Updating token_checks status for {token_address} to {twitter_check_status}...")
+    logger.debug(f"Updating token_checks status for token: {token_address} to {twitter_check_status}...")
     try:
         DB_OPERATIONS_TOTAL.labels(operation="update_token_check_status").inc()
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -371,24 +387,29 @@ def update_token_check_status_supabase(token_address: str, twitter_check_status:
 # ------------------------------------------------------------------------------
 # Token Processing Function
 # ------------------------------------------------------------------------------
-
 def process_token_for_twitter_data(token_data: Dict[str, Any]) -> None:
-    """Processes a single token to fetch and save Twitter data."""
+    """Processes a single token by fetching its Twitter data, filtering and saving the results to Supabase."""
     token_address = token_data['token_address']
     chain = token_data['chain']
-    logger.info(f"Processing Twitter data for token: {token_address} on chain: {chain}...")
-
+    logger.info(f"Processing Twitter data for token: {token_address} on {chain}...")
+    
     spam_accounts = fetch_spam_accounts_from_supabase(chain)
     query = construct_socialdata_query(token_address, spam_accounts)
     api_response_data = fetch_twitter_data(query, SOCIALDATA_API_KEY)
-
+    
+    # If API call fails or returns empty tweets, mark token as undetermined.
     if api_response_data is None:
-        logger.warning(f"Failed to fetch SocialData API data for token: {token_address}. Marking as undetermined.")
+        logger.warning(f"Failed to fetch SocialData API data for token: {token_address} on {chain}. Marking as undetermined.")
+        update_token_check_status_supabase(token_address, 'undetermined')
+        return
+    if not api_response_data.get('tweets'):
+        logger.warning(f"SocialData API returned empty tweets for token: {token_address} on {chain}. Marking as undetermined. Response: {api_response_data}")
         update_token_check_status_supabase(token_address, 'undetermined')
         return
 
     primary_tweet_data, other_tweet_links, primary_tweet_object = process_tweet_data(api_response_data, tweet_link_constructor, spam_accounts)
-
+    
+    # Save tweet data if available; if no primary tweet passes the filter, still mark as checked.
     if primary_tweet_data:
         save_tweet_data_to_supabase(
             token_address=token_address,
@@ -396,20 +417,18 @@ def process_token_for_twitter_data(token_data: Dict[str, Any]) -> None:
             primary_tweet_data=primary_tweet_data,
             other_tweets_data=other_tweet_links,
         )
-        update_token_check_status_supabase(token_address, 'checked')
     else:
-        logger.info(f"No primary tweet data extracted for token: {token_address}. Marking as undetermined.")
-        update_token_check_status_supabase(token_address, 'undetermined')
+        logger.info(f"No primary tweet data extracted for token: {token_address} on {chain}.")
+    update_token_check_status_supabase(token_address, 'checked')
 
 # ------------------------------------------------------------------------------
 # Main Function (Execution Workflow)
 # ------------------------------------------------------------------------------
-
 def main() -> None:
-    """Main function to fetch tokens from Supabase and process them for Twitter data."""
+    """Main function to concurrently fetch tokens from Supabase and process them for Twitter data."""
     global last_breaker_reset
     logger.info("Starting Twitter data fetch and save script.")
-
+    
     initialize_supabase_client()
     start_http_server(PROMETHEUS_PORT)
     logger.info(f"Prometheus metrics server started on port {PROMETHEUS_PORT}")
@@ -418,34 +437,33 @@ def main() -> None:
         if time.time() - last_breaker_reset > BREAKER_RESET_INTERVAL:
             last_breaker_reset = time.time()
             logger.info("Circuit breakers reset timeout reached, allowing automatic reset attempt.")
-
+        
         tokens_to_process = fetch_tokens_for_processing_from_supabase()
-        if not tokens_to_process:
-            logger.info("No new tokens to check. Waiting for next interval.")
-        else:
+        if tokens_to_process:
             TOKENS_PROCESSED_TOTAL.inc(len(tokens_to_process))
-            logger.info(f"Processing {len(tokens_to_process)} tokens for Twitter data.")
-            for token_data in tokens_to_process:
-                if is_shutting_down:
-                    logger.info("Graceful shutdown initiated during token processing.")
-                    break
-                process_token_for_twitter_data(token_data)
-
-        if is_shutting_down:
-            logger.info("Graceful shutdown initiated, exiting main loop.")
-            break
-
+            logger.info(f"Processing {len(tokens_to_process)} tokens concurrently for Twitter data.")
+            with ThreadPoolExecutor(max_workers=THREAD_POOL_WORKERS) as executor:
+                futures = {executor.submit(process_token_for_twitter_data, token): token for token in tokens_to_process}
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"Error processing token: {futures[future]}: {e}")
+            # Clean up tokens from memory after processing the batch.
+            del tokens_to_process
+        else:
+            logger.info("No new tokens to check. Waiting for next interval.")
+        
         time.sleep(CHECK_INTERVAL_SECONDS)
         logger.info("Waiting for next interval before fetching new tokens.")
-
+    
     logger.info("Twitter data fetch and save script stopped.")
 
 # ------------------------------------------------------------------------------
 # Signal Handling and Cleanup
 # ------------------------------------------------------------------------------
-
 def signal_handler(signum: int, frame: Any) -> None:
-    """Handles shutdown signals for graceful termination."""
+    """Handles shutdown signals to initiate graceful shutdown."""
     global is_shutting_down
     is_shutting_down = True
     logger.info("Shutdown signal received, initiating graceful shutdown...")
@@ -454,7 +472,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 def cleanup() -> None:
-    """Cleans up resources before exiting."""
+    """Performs final cleanup tasks before exit."""
     logger.info("Cleanup completed.")
 
 atexit.register(cleanup)
