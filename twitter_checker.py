@@ -304,11 +304,14 @@ def fetch_tokens_for_processing_from_supabase() -> List[Dict[str, Any]]:
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
 def fetch_spam_accounts_from_supabase(chain: str) -> List[str]:
-    """Fetches spam account usernames for a specific chain from Supabase."""
+    """Fetches spam account usernames for a specific chain from Supabase.
+       Updated to query the modified chain column (text[]) using the 'cs' (contains) operator.
+    """
     logger.debug(f"Fetching spam accounts for chain: {chain} from Supabase...")
     try:
         DB_OPERATIONS_TOTAL.labels(operation="select_spam_accounts").inc()
-        response = supabase_client.table("twitter_blacklists").select("username").eq("chain", chain).execute()
+        # Use the 'cs' operator to check if the chain array contains the given value.
+        response = supabase_client.table("twitter_blacklists").select("username").filter("chain", "cs", f'{{"{chain}"}}').execute()
         if not response.data:
             SUPABASE_ERROR_COUNTER.labels(operation="select_spam_accounts").inc()
             logger.warning(f"Supabase query returned empty data for spam accounts for chain {chain}: {response}")
